@@ -43,6 +43,9 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <pcl/io/pcd_io.h>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
@@ -799,6 +802,8 @@ class LaserMappingNode : public rclcpp::Node
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
+        this->declare_parameter<bool>("locate_in_prior_map", false);
+        this->declare_parameter<string>("prior_map_path", "");
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -839,6 +844,14 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
+        this->get_parameter_or<bool>("locate_in_prior_map", locate_in_prior_map_, false);
+        this->get_parameter_or<string>("prior_map_path", prior_map_path_, "");
+        if (locate_in_prior_map_)
+        {
+            if (prior_map_path_.empty() || pcl::io::loadPCDFile<PointType>(prior_map_path_, *prior_map_) < 0 || prior_map_->empty())
+                throw std::runtime_error("Localization requires a nonempty prior_map_path PCD");
+            RCLCPP_INFO(this->get_logger(), "Loaded %zu prior map points", prior_map_->size());
+        }
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
@@ -932,6 +945,17 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (locate_in_prior_map_)
+            sub_init_pose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+                "/icp_result", 10, [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+                    if (msg->header.frame_id != "map") return;
+                    initial_pose_ = *msg;
+                    initial_pose_received_ = true;
+                    reset_filter_pending_ = prior_map_initialized_;
+                    relocalization_pending_ = true;
+                    map_tf_valid_ = false;
+                    RCLCPP_INFO(this->get_logger(), "Received ICP result; rebuilding prior-map alignment");
+                });
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -964,8 +988,32 @@ public:
 private:
     void timer_callback()
     {
+        if (map_tf_valid_)
+        {
+            map_tf_.header.stamp = this->now();
+            tf_broadcaster_->sendTransform(map_tf_);
+        }
+        if (locate_in_prior_map_ && !initial_pose_received_)
+            return;
         if(sync_packages(Measures))
         {
+            if (locate_in_prior_map_ && reset_filter_pending_)
+            {
+                // Discard drifted attitude and IMU biases as well as position.
+                // IMU_init restores gravity, biases and configured extrinsics.
+                p_imu->Reset();
+                state_ikfom reset_state;
+                kf.change_x(reset_state);
+                auto reset_cov = kf.get_P();
+                reset_cov.setIdentity();
+                kf.change_P(reset_cov);
+                flg_first_scan = true;
+                flg_EKF_inited = false;
+                Localmap_Initialized = false;
+                path.poses.clear();
+                reset_filter_pending_ = false;
+                RCLCPP_INFO(this->get_logger(), "Reset FAST-LIO filter and IMU initialization for relocalization");
+            }
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -983,6 +1031,7 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
+            if (locate_in_prior_map_) feats_undistort->clear();
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -996,7 +1045,7 @@ private:
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            if (!locate_in_prior_map_) lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1004,10 +1053,53 @@ private:
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            if(ikdtree.Root_Node == nullptr || (locate_in_prior_map_ && relocalization_pending_))
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
-                if(feats_down_size > 5)
+                if (locate_in_prior_map_)
+                {
+                    downSizeFilterMap.setInputCloud(prior_map_);
+                    PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
+                    downSizeFilterMap.filter(*filtered);
+                    Eigen::Quaterniond q(initial_pose_.pose.pose.orientation.w,
+                                         initial_pose_.pose.pose.orientation.x,
+                                         initial_pose_.pose.pose.orientation.y,
+                                         initial_pose_.pose.pose.orientation.z);
+                    Eigen::Vector3d lidar_t(initial_pose_.pose.pose.position.x,
+                                      initial_pose_.pose.pose.position.y,
+                                      initial_pose_.pose.pose.position.z);
+                    if (q.norm() < 0.5) throw std::runtime_error("Invalid ICP initial orientation");
+                    q.normalize();
+                    // ICP estimates map <- LiDAR. The IMU filter may already have
+                    // rotated its state to align gravity before this first scan.
+                    Eigen::Quaterniond scan_q(state_point.rot.toRotationMatrix() * state_point.offset_R_L_I);
+                    Eigen::Vector3d scan_t = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                    Eigen::Quaterniond world_q = q * scan_q.inverse();
+                    Eigen::Vector3d world_t = lidar_t - world_q * scan_t;
+                    geometry_msgs::msg::TransformStamped map_tf;
+                    map_tf.header.stamp = this->now();
+                    map_tf.header.frame_id = "map";
+                    map_tf.child_frame_id = world_frame;
+                    map_tf.transform.translation.x = world_t.x();
+                    map_tf.transform.translation.y = world_t.y();
+                    map_tf.transform.translation.z = world_t.z();
+                    map_tf.transform.rotation.x = world_q.x();
+                    map_tf.transform.rotation.y = world_q.y();
+                    map_tf.transform.rotation.z = world_q.z();
+                    map_tf.transform.rotation.w = world_q.w();
+                    map_tf_ = map_tf;
+                    map_tf_valid_ = true;
+                    tf_broadcaster_->sendTransform(map_tf_);
+                    for (auto &point : filtered->points) {
+                        Eigen::Vector3d p = world_q.inverse() * (Eigen::Vector3d(point.x, point.y, point.z) - world_t);
+                        point.x = p.x(); point.y = p.y(); point.z = p.z();
+                    }
+                    ikdtree.set_downsample_param(filter_size_map_min);
+                    ikdtree.Build(filtered->points);
+                    relocalization_pending_ = false;
+                    prior_map_initialized_ = true;
+                }
+                else if(feats_down_size > 5)
                 {
                     ikdtree.set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
@@ -1089,7 +1181,7 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
+            if (!locate_in_prior_map_) map_incremental();
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1161,6 +1253,17 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pubExtrinsic_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_init_pose_;
+    geometry_msgs::msg::TransformStamped map_tf_;
+    bool map_tf_valid_ = false;
+    PointCloudXYZI::Ptr prior_map_{new PointCloudXYZI()};
+    geometry_msgs::msg::PoseWithCovarianceStamped initial_pose_;
+    string prior_map_path_;
+    bool locate_in_prior_map_ = false;
+    bool initial_pose_received_ = false;
+    bool relocalization_pending_ = false;
+    bool reset_filter_pending_ = false;
+    bool prior_map_initialized_ = false;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
