@@ -949,6 +949,16 @@ public:
             sub_init_pose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
                 "/icp_result", 10, [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
                     if (msg->header.frame_id != "map") return;
+                    // Localization does not consume scans before the first ICP pose.
+                    // Drop that backlog (and any drifted scans on reinitialization)
+                    // so odometry resumes at the current sensor timestamps.
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_buffer);
+                        lidar_buffer.clear();
+                        time_buffer.clear();
+                        imu_buffer.clear();
+                        lidar_pushed = false;
+                    }
                     initial_pose_ = *msg;
                     initial_pose_received_ = true;
                     reset_filter_pending_ = prior_map_initialized_;
