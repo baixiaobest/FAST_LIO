@@ -58,6 +58,7 @@
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -804,6 +805,7 @@ public:
     {
         this->declare_parameter<bool>("locate_in_prior_map", false);
         this->declare_parameter<string>("prior_map_path", "");
+        this->declare_parameter<bool>("append_to_prior_map", false);
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -845,12 +847,16 @@ public:
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("locate_in_prior_map", locate_in_prior_map_, false);
+        this->get_parameter_or<bool>("append_to_prior_map", append_to_prior_map_, false);
+        if (append_to_prior_map_ && !locate_in_prior_map_)
+            throw std::runtime_error("append_to_prior_map requires locate_in_prior_map");
         this->get_parameter_or<string>("prior_map_path", prior_map_path_, "");
         if (locate_in_prior_map_)
         {
             if (prior_map_path_.empty() || pcl::io::loadPCDFile<PointType>(prior_map_path_, *prior_map_) < 0 || prior_map_->empty())
                 throw std::runtime_error("Localization requires a nonempty prior_map_path PCD");
             RCLCPP_INFO(this->get_logger(), "Loaded %zu prior map points", prior_map_->size());
+            if (append_to_prior_map_) *merged_map_ = *prior_map_;
         }
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
@@ -964,8 +970,23 @@ public:
                     reset_filter_pending_ = prior_map_initialized_;
                     relocalization_pending_ = true;
                     map_tf_valid_ = false;
+                    mapping_paused_ = false;  // allow the reset scan to rebuild alignment
                     RCLCPP_INFO(this->get_logger(), "Received ICP result; rebuilding prior-map alignment");
                 });
+        if (append_to_prior_map_)
+        {
+            pause_sub_ = this->create_subscription<std_msgs::msg::Empty>(
+                "/checkpoint_map/pause_mapping", 10, [this](std_msgs::msg::Empty::SharedPtr) {
+                    mapping_paused_ = true;
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_buffer);
+                        lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
+                    }
+                    map_publish_callback();  // ICP receives a frozen current target.
+                });
+            checkpoint_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "/checkpoint_map/icp_target", rclcpp::QoS(1).reliable().transient_local());
+        }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -998,6 +1019,11 @@ public:
 private:
     void timer_callback()
     {
+        if (append_to_prior_map_ && (mapping_paused_ || !initial_pose_received_)) {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
+            return;
+        }
         if (map_tf_valid_)
         {
             map_tf_.header.stamp = this->now();
@@ -1068,6 +1094,7 @@ private:
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if (locate_in_prior_map_)
                 {
+                    if (append_to_prior_map_) *prior_map_ = *merged_map_;
                     downSizeFilterMap.setInputCloud(prior_map_);
                     PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
                     downSizeFilterMap.filter(*filtered);
@@ -1108,6 +1135,7 @@ private:
                     ikdtree.Build(filtered->points);
                     relocalization_pending_ = false;
                     prior_map_initialized_ = true;
+                    mapping_paused_ = false;
                 }
                 else if(feats_down_size > 5)
                 {
@@ -1191,7 +1219,21 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            if (!locate_in_prior_map_) map_incremental();
+            if (!locate_in_prior_map_ || append_to_prior_map_) {
+                map_incremental();
+                if (append_to_prior_map_) {
+                    Eigen::Quaterniond q(map_tf_.transform.rotation.w, map_tf_.transform.rotation.x,
+                                         map_tf_.transform.rotation.y, map_tf_.transform.rotation.z);
+                    Eigen::Vector3d t(map_tf_.transform.translation.x, map_tf_.transform.translation.y,
+                                      map_tf_.transform.translation.z);
+                    for (const auto &p : feats_down_world->points) {
+                        PointType mapped = p;
+                        Eigen::Vector3d xyz = q * Eigen::Vector3d(p.x, p.y, p.z) + t;
+                        mapped.x = xyz.x(); mapped.y = xyz.y(); mapped.z = xyz.z();
+                        merged_map_->push_back(mapped);
+                    }
+                }
+            }
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1235,6 +1277,15 @@ private:
 
     void map_publish_callback()
     {
+        if (append_to_prior_map_) {
+            sensor_msgs::msg::PointCloud2 cloud;
+            pcl::toROSMsg(*merged_map_, cloud);
+            cloud.header.stamp = this->now(); cloud.header.frame_id = "map";
+            if (mapping_paused_ || !initial_pose_received_)
+                checkpoint_map_pub_->publish(cloud);
+            pubLaserCloudMap_->publish(cloud);
+            return;
+        }
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
@@ -1243,9 +1294,18 @@ private:
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
+            if (append_to_prior_map_ && (!prior_map_initialized_ || mapping_paused_)) {
+                res->success = false; res->message = "Checkpoint mapping is not initialized";
+            } else if (append_to_prior_map_) {
+                const string temporary = map_file_path + ".tmp";
+                if (pcl::io::savePCDFileBinary(temporary, *merged_map_) != 0 ||
+                    std::rename(temporary.c_str(), map_file_path.c_str()) != 0) {
+                    std::remove(temporary.c_str());
+                    res->success = false; res->message = "Could not save merged map";
+                } else { res->success = true; res->message = "Merged map saved."; }
+            } else {
+                save_to_pcd(); res->success = true; res->message = "Map saved.";
+            }
         }
         else
         {
@@ -1264,12 +1324,17 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_init_pose_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr pause_sub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr checkpoint_map_pub_;
     geometry_msgs::msg::TransformStamped map_tf_;
     bool map_tf_valid_ = false;
     PointCloudXYZI::Ptr prior_map_{new PointCloudXYZI()};
+    PointCloudXYZI::Ptr merged_map_{new PointCloudXYZI()};
     geometry_msgs::msg::PoseWithCovarianceStamped initial_pose_;
     string prior_map_path_;
     bool locate_in_prior_map_ = false;
+    bool append_to_prior_map_ = false;
+    bool mapping_paused_ = false;
     bool initial_pose_received_ = false;
     bool relocalization_pending_ = false;
     bool reset_filter_pending_ = false;
