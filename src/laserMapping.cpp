@@ -39,6 +39,7 @@
 #include <fstream>
 #include <csignal>
 #include <chrono>
+#include <limits>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
@@ -58,6 +59,7 @@
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <fast_lio/msg/estimator_diagnostics.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -636,7 +638,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = imu_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -648,6 +649,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = world_frame;
@@ -992,6 +994,7 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubEstimatorDiagnostics_ = this->create_publisher<fast_lio::msg::EstimatorDiagnostics>("/fast_lio/estimator_diagnostics", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         if (!extrinsic_topic.empty())
             pubExtrinsic_ = this->create_publisher<geometry_msgs::msg::TransformStamped>(extrinsic_topic, 20);
@@ -1187,7 +1190,11 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            const state_ikfom predicted_state = kf.get_x();
+            effct_feat_num = 0;
+            res_mean_last = std::numeric_limits<double>::quiet_NaN();
+            const bool update_applied = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            const bool update_valid = update_applied && effct_feat_num > 0;
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1216,6 +1223,28 @@ private:
                 pubExtrinsic_->publish(extrinsic);
             }
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            fast_lio::msg::EstimatorDiagnostics diagnostics;
+            diagnostics.header = odomAftMapped.header;
+            diagnostics.update_valid = update_valid;
+            diagnostics.downsampled_points = feats_down_size;
+            diagnostics.matched_points = update_valid ? effct_feat_num : 0;
+            diagnostics.mean_abs_residual = update_valid ? res_mean_last : std::numeric_limits<double>::quiet_NaN();
+            const auto P = kf.get_P();
+            for (int i = 0; i < 3; ++i) {
+                diagnostics.position_stddev[i] = std::sqrt(std::max(0.0, P(i + 3, i + 3)));
+                diagnostics.rotation_stddev[i] = std::sqrt(std::max(0.0, P(i, i)));
+                diagnostics.lidar_position_correction[i] = update_valid
+                    ? state_point.pos[i] - predicted_state.pos[i] : std::numeric_limits<double>::quiet_NaN();
+            }
+            if (update_valid) {
+                const Eigen::Quaterniond predicted_rotation(predicted_state.rot.toRotationMatrix());
+                const Eigen::Quaterniond updated_rotation(state_point.rot.toRotationMatrix());
+                const Eigen::Quaterniond difference = predicted_rotation.conjugate() * updated_rotation;
+                diagnostics.lidar_rotation_correction = 2.0 * std::atan2(difference.vec().norm(), std::abs(difference.w()));
+            } else {
+                diagnostics.lidar_rotation_correction = std::numeric_limits<double>::quiet_NaN();
+            }
+            pubEstimatorDiagnostics_->publish(diagnostics);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1320,6 +1349,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<fast_lio::msg::EstimatorDiagnostics>::SharedPtr pubEstimatorDiagnostics_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pubExtrinsic_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;

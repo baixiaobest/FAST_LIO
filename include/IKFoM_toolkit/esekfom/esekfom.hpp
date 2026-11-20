@@ -1616,7 +1616,7 @@ public:
 	}
 	
 	//iterated error state EKF update modified for one specific system.
-	void update_iterated_dyn_share_modified(double R, double &solve_time) {
+	bool update_iterated_dyn_share_modified(double R, double &solve_time) {
 		
 		dyn_share_datastruct<scalar_type> dyn_share;
 		dyn_share.valid = true;
@@ -1628,6 +1628,7 @@ public:
 		
 		Matrix<scalar_type, n, 1> K_h;
 		Matrix<scalar_type, n, n> K_x; 
+		bool update_applied = false;
 		
 		vectorized_state dx_new = vectorized_state::Zero();
 		for(int i=-1; i<maximum_iter; i++)
@@ -1815,6 +1816,7 @@ public:
 			Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new; 
 			state x_before = x_;
 			x_.boxplus(dx_);
+			update_applied = true;
 			dyn_share.converge = true;
 			for(int i = 0; i < n ; i++)
 			{
@@ -1924,10 +1926,11 @@ public:
 					P_ = L_ - K_x.template block<n, 12>(0, 0) * P_.template block<12, n>(0, 0);
 				//}
 				solve_time += omp_get_wtime() - solve_start;
-				return;
+				return true;
 			}
 			solve_time += omp_get_wtime() - solve_start;
 		}
+		return update_applied;
 	}
 
 	void change_x(state &input_state)
