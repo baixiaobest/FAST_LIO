@@ -60,6 +60,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <fast_lio/msg/estimator_diagnostics.hpp>
+#include <fast_lio/msg/pose_information.hpp>
 #include <fast_lio/msg/match_debug.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <std_msgs/msg/empty.hpp>
@@ -125,6 +126,8 @@ PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
+Eigen::Matrix<double, 6, 6> pose_information = Eigen::Matrix<double, 6, 6>::Zero();
+bool pose_information_valid = false;
 PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
@@ -800,6 +803,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+    // Keep the Jacobian from the latest valid iteration, before the filter changes its state.
+    pose_information.noalias() = ekfom_data.h_x.leftCols<6>().transpose() * ekfom_data.h_x.leftCols<6>();
+    pose_information /= LASER_POINT_COV;
+    pose_information_valid = true;
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -1000,6 +1007,7 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubEstimatorDiagnostics_ = this->create_publisher<fast_lio::msg::EstimatorDiagnostics>("/fast_lio/estimator_diagnostics", 20);
+        pubPoseInformation_ = this->create_publisher<fast_lio::msg::PoseInformation>("/fast_lio/pose_information", 20);
         if (match_debug_en)
             pubMatchDebug_ = this->create_publisher<fast_lio::msg::MatchDebug>("/fast_lio/match_debug", 10);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
@@ -1199,6 +1207,7 @@ private:
             double solve_H_time = 0;
             const state_ikfom predicted_state = kf.get_x();
             effct_feat_num = 0;
+            pose_information_valid = false;
             res_mean_last = std::numeric_limits<double>::quiet_NaN();
             const bool update_applied = kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             const bool update_valid = update_applied && effct_feat_num > 0;
@@ -1252,6 +1261,16 @@ private:
                 diagnostics.lidar_rotation_correction = std::numeric_limits<double>::quiet_NaN();
             }
             pubEstimatorDiagnostics_->publish(diagnostics);
+            fast_lio::msg::PoseInformation pose_info;
+            pose_info.header = diagnostics.header;
+            pose_info.update_valid = update_valid && pose_information_valid;
+            pose_info.matched_points = pose_info.update_valid ? effct_feat_num : 0;
+            int upper_index = 0;
+            for (int row = 0; row < 6; ++row)
+                for (int col = row; col < 6; ++col)
+                    pose_info.upper_triangle[upper_index++] = pose_info.update_valid
+                        ? pose_information(row, col) : std::numeric_limits<double>::quiet_NaN();
+            pubPoseInformation_->publish(pose_info);
 
             if (pubMatchDebug_)
             {
@@ -1395,6 +1414,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<fast_lio::msg::EstimatorDiagnostics>::SharedPtr pubEstimatorDiagnostics_;
+    rclcpp::Publisher<fast_lio::msg::PoseInformation>::SharedPtr pubPoseInformation_;
     rclcpp::Publisher<fast_lio::msg::MatchDebug>::SharedPtr pubMatchDebug_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pubExtrinsic_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;

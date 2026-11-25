@@ -86,6 +86,7 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 set(msg_files
   "msg/Pose6D.msg"
   "msg/EstimatorDiagnostics.msg"
+  "msg/PoseInformation.msg"
   "msg/MatchDebug.msg"
   "msg/MatchDebugLegacy.msg"
 )
