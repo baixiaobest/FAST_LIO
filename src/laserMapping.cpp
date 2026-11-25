@@ -1245,6 +1245,10 @@ private:
             diagnostics.downsampled_points = feats_down_size;
             diagnostics.matched_points = update_valid ? effct_feat_num : 0;
             diagnostics.mean_abs_residual = update_valid ? res_mean_last : std::numeric_limits<double>::quiet_NaN();
+            const Eigen::Quaterniond predicted_orientation(predicted_state.rot.toRotationMatrix());
+            diagnostics.predicted_orientation_xyzw = {
+                predicted_orientation.x(), predicted_orientation.y(),
+                predicted_orientation.z(), predicted_orientation.w()};
             const auto P = kf.get_P();
             for (int i = 0; i < 3; ++i) {
                 diagnostics.position_stddev[i] = std::sqrt(std::max(0.0, P(i + 3, i + 3)));

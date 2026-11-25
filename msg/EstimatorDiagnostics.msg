@@ -7,3 +7,5 @@ uint32 matched_points
 float64 mean_abs_residual
 float64[3] lidar_position_correction
 float64 lidar_rotation_correction
+# IMU-propagated orientation immediately before the LiDAR update, xyzw.
+float64[4] predicted_orientation_xyzw
