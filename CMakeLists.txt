@@ -86,11 +86,13 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 set(msg_files
   "msg/Pose6D.msg"
   "msg/EstimatorDiagnostics.msg"
+  "msg/MatchDebug.msg"
+  "msg/MatchDebugLegacy.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
-  DEPENDENCIES std_msgs
+  DEPENDENCIES std_msgs geometry_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)
 

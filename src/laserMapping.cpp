@@ -60,6 +60,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <fast_lio/msg/estimator_diagnostics.hpp>
+#include <fast_lio/msg/match_debug.hpp>
+#include <geometry_msgs/msg/point32.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -104,6 +106,7 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool   match_debug_en = false;
 bool    is_first_lidar = true;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -814,6 +817,7 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.match_debug_en", false);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -865,6 +869,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.match_debug_en", match_debug_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -995,6 +1000,8 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubEstimatorDiagnostics_ = this->create_publisher<fast_lio::msg::EstimatorDiagnostics>("/fast_lio/estimator_diagnostics", 20);
+        if (match_debug_en)
+            pubMatchDebug_ = this->create_publisher<fast_lio::msg::MatchDebug>("/fast_lio/match_debug", 10);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         if (!extrinsic_topic.empty())
             pubExtrinsic_ = this->create_publisher<geometry_msgs::msg::TransformStamped>(extrinsic_topic, 20);
@@ -1246,6 +1253,44 @@ private:
             }
             pubEstimatorDiagnostics_->publish(diagnostics);
 
+            if (pubMatchDebug_)
+            {
+                fast_lio::msg::MatchDebug debug;
+                debug.header = diagnostics.header;
+                debug.update_valid = update_valid;
+                debug.downsampled_returns.reserve(feats_down_size);
+                debug.matched_indices.reserve(update_valid ? effct_feat_num : 0);
+                debug.match_normals.reserve(update_valid ? effct_feat_num : 0);
+                debug.map_neighbors.reserve(update_valid ? effct_feat_num * NUM_MATCH_POINTS : 0);
+                debug.signed_residuals.reserve(update_valid ? effct_feat_num : 0);
+                for (int i = 0; i < feats_down_size; ++i)
+                {
+                    // h_share_model computed these world coordinates at the matching linearization.
+                    if (!update_valid)
+                        pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                    const auto &p = feats_down_world->points[i];
+                    geometry_msgs::msg::Point32 point;
+                    point.x = p.x; point.y = p.y; point.z = p.z;
+                    debug.downsampled_returns.push_back(point);
+                    if (!update_valid || !point_selected_surf[i] ||
+                        Nearest_Points[i].size() != NUM_MATCH_POINTS) continue;
+                    debug.matched_indices.push_back(i);
+                    geometry_msgs::msg::Vector3 normal;
+                    normal.x = normvec->points[i].x;
+                    normal.y = normvec->points[i].y;
+                    normal.z = normvec->points[i].z;
+                    debug.match_normals.push_back(normal);
+                    debug.signed_residuals.push_back(normvec->points[i].intensity);
+                    for (const auto &neighbor : Nearest_Points[i])
+                    {
+                        geometry_msgs::msg::Point32 map_point;
+                        map_point.x = neighbor.x; map_point.y = neighbor.y; map_point.z = neighbor.z;
+                        debug.map_neighbors.push_back(map_point);
+                    }
+                }
+                pubMatchDebug_->publish(debug);
+            }
+
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             if (!locate_in_prior_map_ || append_to_prior_map_) {
@@ -1350,6 +1395,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<fast_lio::msg::EstimatorDiagnostics>::SharedPtr pubEstimatorDiagnostics_;
+    rclcpp::Publisher<fast_lio::msg::MatchDebug>::SharedPtr pubMatchDebug_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pubExtrinsic_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
