@@ -20,6 +20,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include "use-ikfom.hpp"
+#include "learned_velocity_fusion.hpp"
+#include <functional>
 
 /// *************Preconfiguration
 
@@ -48,6 +50,10 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  void configure_learned_velocity(const V3D &r_IB, const M3D &R_BI, const V3D &sigma,
+      std::deque<learned_velocity::Observation> *queue,
+      std::function<void(const learned_velocity::Result &, uint8_t)> report);
+  double last_processed_time() const { return last_lidar_end_time_; }
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -76,13 +82,19 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  bool learned_velocity_enabled_ = false;
+  V3D learned_r_IB_ = V3D::Zero();
+  M3D learned_R_BI_ = M3D::Identity();
+  V3D learned_sigma_ = V3D::Constant(0.5);
+  std::deque<learned_velocity::Observation> *learned_queue_ = nullptr;
+  std::function<void(const learned_velocity::Result &, uint8_t)> report_learned_;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
 };
 
 ImuProcess::ImuProcess()
-    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
+    : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1), last_lidar_end_time_(-1)
 {
   init_iter_num = 1;
   Q = process_noise_cov();
@@ -109,11 +121,24 @@ void ImuProcess::Reset()
   b_first_frame_    = true;
   imu_need_init_    = true;
   start_timestamp_  = -1;
+  last_lidar_end_time_ = -1;
   init_iter_num     = 1;
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::msg::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+}
+
+void ImuProcess::configure_learned_velocity(const V3D &r_IB, const M3D &R_BI,
+    const V3D &sigma, std::deque<learned_velocity::Observation> *queue,
+    std::function<void(const learned_velocity::Result &, uint8_t)> report)
+{
+  learned_velocity_enabled_ = true;
+  learned_r_IB_ = r_IB;
+  learned_R_BI_ = R_BI;
+  learned_sigma_ = sigma;
+  learned_queue_ = queue;
+  report_learned_ = std::move(report);
 }
 
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
@@ -239,6 +264,41 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  auto append_pose = [&](double stamp, const V3D &gyro) {
+    imu_state = kf_state.get_x();
+    angvel_last = gyro - imu_state.bg;
+    acc_s_last = imu_state.rot * (in.acc - imu_state.ba);
+    for (int i = 0; i < 3; ++i) acc_s_last[i] += imu_state.grav[i];
+    IMUpose.push_back(set_pose6d(stamp - pcl_beg_time, acc_s_last, angvel_last,
+        imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
+  };
+  auto propagate_with_velocity = [&](double begin, double end, const V3D &gyro) {
+    double current = begin;
+    while (learned_queue_ && !learned_queue_->empty() && learned_queue_->front().time <= end + 1e-9) {
+      const auto sample = learned_queue_->front();
+      learned_queue_->pop_front();
+      learned_velocity::Result result;
+      result.observation = sample;
+      if (sample.time <= last_lidar_end_time_ + 1e-9 || sample.time < current - 1e-9) {
+        report_learned_(result, 1);  // Already past this observation time.
+        continue;
+      }
+      if (sample.time > current) {
+        double segment = sample.time - current;
+        kf_state.predict(segment, Q, in);
+        current = sample.time;
+      }
+      append_pose(current, gyro);  // State just before the instantaneous correction.
+      const bool accepted = learned_velocity::update(kf_state, sample, gyro,
+          learned_r_IB_, learned_R_BI_, learned_sigma_, result);
+      report_learned_(result, accepted ? 0 : 3);
+      append_pose(current, gyro);  // State just after the correction.
+    }
+    if (end > current) {
+      double segment = end - current;
+      kf_state.predict(segment, Q, in);
+    }
+  };
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);
@@ -276,7 +336,11 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    kf_state.predict(dt, Q, in);
+    if (learned_velocity_enabled_) {
+      propagate_with_velocity(tail_stamp - dt, tail_stamp, angvel_avr);
+    } else {
+      kf_state.predict(dt, Q, in);
+    }
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
@@ -293,7 +357,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
-  kf_state.predict(dt, Q, in);
+  if (learned_velocity_enabled_) {
+    const double current = std::max(imu_end_time, last_lidar_end_time_);
+    propagate_with_velocity(current, pcl_end_time, in.gyro);
+    append_pose(pcl_end_time, in.gyro);
+  } else {
+    kf_state.predict(dt, Q, in);
+  }
   
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
@@ -302,6 +372,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** undistort each lidar point (backward propagation) ***/
   if (pcl_out.points.begin() == pcl_out.points.end()) return;
   auto it_pcl = pcl_out.points.end() - 1;
+  bool first_point_processed = false;
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
   {
     auto head = it_kp - 1;
@@ -313,7 +384,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     acc_imu<<VEC_FROM_ARRAY(tail->acc);
     angvel_avr<<VEC_FROM_ARRAY(tail->gyr);
 
-    for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
+    for(; it_pcl->curvature / double(1000) >= head->offset_time; it_pcl --)
     {
       dt = it_pcl->curvature / double(1000) - head->offset_time;
 
@@ -332,8 +403,12 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       it_pcl->y = P_compensate(1);
       it_pcl->z = P_compensate(2);
 
-      if (it_pcl == pcl_out.points.begin()) break;
+      if (it_pcl == pcl_out.points.begin()) {
+        first_point_processed = true;
+        break;
+      }
     }
+    if (first_point_processed) break;
   }
 }
 

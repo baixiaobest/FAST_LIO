@@ -55,6 +55,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
@@ -90,11 +91,12 @@ set(msg_files
   "msg/PoseInformation.msg"
   "msg/MatchDebug.msg"
   "msg/MatchDebugLegacy.msg"
+  "msg/VelocityFusionDebug.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
-  DEPENDENCIES std_msgs geometry_msgs
+  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -120,6 +122,17 @@ else()
 endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_learned_velocity_fusion test/test_learned_velocity_fusion.cpp)
+  target_include_directories(test_learned_velocity_fusion PRIVATE include)
+  target_link_libraries(test_learned_velocity_fusion Eigen3::Eigen)
+  ament_add_gtest(test_learned_velocity_timing test/test_learned_velocity_timing.cpp)
+  target_include_directories(test_learned_velocity_timing PRIVATE include src ${PCL_INCLUDE_DIRS})
+  target_link_libraries(test_learned_velocity_timing Eigen3::Eigen ${PCL_LIBRARIES} ${cpp_typesupport_target})
+  ament_target_dependencies(test_learned_velocity_timing rclcpp sensor_msgs nav_msgs pcl_conversions)
+endif()
 
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping

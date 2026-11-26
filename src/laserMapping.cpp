@@ -62,6 +62,8 @@
 #include <fast_lio/msg/estimator_diagnostics.hpp>
 #include <fast_lio/msg/pose_information.hpp>
 #include <fast_lio/msg/match_debug.hpp>
+#include <fast_lio/msg/velocity_fusion_debug.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -108,6 +110,7 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool   match_debug_en = false;
+bool   imu_time_reset_pending = false;
 bool    is_first_lidar = true;
 
 vector<vector<int>>  pointSearchInd_surf; 
@@ -382,6 +385,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         imu_buffer.clear();
+        imu_time_reset_pending = (last_timestamp_imu - timestamp > 0.5);
     }
 
     last_timestamp_imu = timestamp;
@@ -829,6 +833,13 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("learned_velocity.mode", "imu_lidar");
+        this->declare_parameter<string>("learned_velocity.topic", "/estimated_velocity");
+        this->declare_parameter<vector<double>>("learned_velocity.stddev", {0.5, 0.5, 0.5});
+        this->declare_parameter<vector<double>>("learned_velocity.base_in_imu_translation", {0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("learned_velocity.base_in_imu_rotation", {1.0, 0.0, 0.0,
+                                                                                       0.0, 1.0, 0.0,
+                                                                                       0.0, 0.0, 1.0});
         this->declare_parameter<string>("frames.world", "camera_init");
         this->declare_parameter<string>("frames.imu", "body");
         this->declare_parameter<string>("publish.extrinsic_topic", "");
@@ -881,8 +892,28 @@ public:
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<string>("learned_velocity.mode", velocity_mode_, "imu_lidar");
+        this->get_parameter_or<string>("learned_velocity.topic", velocity_topic_, "/estimated_velocity");
+        vector<double> velocity_stddev, base_in_imu_translation, base_in_imu_rotation;
+        this->get_parameter_or<vector<double>>("learned_velocity.stddev", velocity_stddev, {0.5, 0.5, 0.5});
+        this->get_parameter_or<vector<double>>("learned_velocity.base_in_imu_translation", base_in_imu_translation, {0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("learned_velocity.base_in_imu_rotation", base_in_imu_rotation,
+            {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
+        if (velocity_mode_ != "imu_lidar" && velocity_mode_ != "imu_lidar_learned_velocity")
+            throw std::runtime_error("learned_velocity.mode must be imu_lidar or imu_lidar_learned_velocity");
+        learned_velocity_enabled_ = velocity_mode_ == "imu_lidar_learned_velocity";
+        if (learned_velocity_enabled_) {
+            if (velocity_stddev.size() != 3 || base_in_imu_translation.size() != 3 ||
+                base_in_imu_rotation.size() != 9)
+                throw std::runtime_error("Learned velocity stddev/translation/rotation must have 3/3/9 values");
+            for (double value : velocity_stddev)
+                if (!std::isfinite(value) || value <= 0)
+                    throw std::runtime_error("Learned velocity standard deviations must be finite and positive");
+        }
         this->get_parameter_or<string>("frames.world", world_frame, "camera_init");
         this->get_parameter_or<string>("frames.imu", imu_frame, "body");
+        if (learned_velocity_enabled_ && imu_frame != "body")
+            throw std::runtime_error("Learned velocity fusion currently requires the body IMU frame");
         string extrinsic_topic;
         this->get_parameter_or<string>("publish.extrinsic_topic", extrinsic_topic, "");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
@@ -943,6 +974,24 @@ public:
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+        if (learned_velocity_enabled_) {
+            V3D r_IB;
+            r_IB << VEC_FROM_ARRAY(base_in_imu_translation);
+            M3D R_IB;
+            R_IB << MAT_FROM_ARRAY(base_in_imu_rotation);
+            if (!r_IB.allFinite() || !R_IB.allFinite() ||
+                (R_IB.transpose() * R_IB - M3D::Identity()).norm() > 1e-3 ||
+                std::abs(R_IB.determinant() - 1.0) > 1e-3)
+                throw std::runtime_error("Invalid base_link pose in IMU frame");
+            V3D sigma;
+            sigma << VEC_FROM_ARRAY(velocity_stddev);
+            pubVelocityFusionDebug_ = this->create_publisher<fast_lio::msg::VelocityFusionDebug>(
+                "/fast_lio/velocity_fusion_debug", 20);
+            p_imu->configure_learned_velocity(r_IB, R_IB.transpose(), sigma, &learned_velocity_queue_,
+                [this](const learned_velocity::Result &result, uint8_t status) {
+                    this->publish_velocity_fusion_debug(result, status);
+                });
+        }
 
         /*** debug record ***/
         // FILE *fp;
@@ -965,6 +1014,10 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (learned_velocity_enabled_)
+            subLearnedVelocity_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
+                velocity_topic_, 50, std::bind(&LaserMappingNode::learned_velocity_callback,
+                    this, std::placeholders::_1));
         if (locate_in_prior_map_)
             sub_init_pose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
                 "/icp_result", 10, [this](geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
@@ -979,6 +1032,7 @@ public:
                         imu_buffer.clear();
                         lidar_pushed = false;
                     }
+                    learned_velocity_queue_.clear();
                     initial_pose_ = *msg;
                     initial_pose_received_ = true;
                     reset_filter_pending_ = prior_map_initialized_;
@@ -996,6 +1050,7 @@ public:
                         std::lock_guard<std::mutex> lock(mtx_buffer);
                         lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
                     }
+                    learned_velocity_queue_.clear();
                     map_publish_callback();  // ICP receives a frozen current target.
                 });
             checkpoint_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -1035,11 +1090,110 @@ public:
     }
 
 private:
+    void publish_velocity_fusion_debug(const learned_velocity::Result &result, uint8_t status)
+    {
+        if (!pubVelocityFusionDebug_) return;
+        fast_lio::msg::VelocityFusionDebug debug;
+        debug.header.stamp = get_ros_time(result.observation.original_time);
+        debug.header.frame_id = "base_link";
+        debug.arrival_stamp = get_ros_time(result.observation.arrival_time);
+        debug.processing_stamp = this->now();
+        debug.fusion_stamp = get_ros_time(result.observation.time);
+        debug.status = status;
+        for (int i = 0; i < 3; ++i) {
+            debug.learned_velocity[i] = result.observation.velocity[i];
+            debug.predicted_velocity[i] = result.predicted[i];
+            debug.residual[i] = result.residual[i];
+            debug.velocity_before[i] = result.velocity_before[i];
+            debug.velocity_after[i] = result.velocity_after[i];
+            debug.gyro_bias[i] = result.gyro_bias[i];
+            debug.accel_bias[i] = result.accel_bias[i];
+        }
+        debug.nis = status == 0 ? result.nis : std::numeric_limits<double>::quiet_NaN();
+        for (int i = 0; i < 23; ++i) {
+            debug.state_correction[i] = result.correction[i];
+            debug.covariance_diagonal[i] = result.covariance_diagonal[i];
+            for (int j = 0; j < 3; ++j) debug.kalman_gain[i * 3 + j] = result.gain(i, j);
+        }
+        pubVelocityFusionDebug_->publish(debug);
+    }
+
+    void learned_velocity_callback(const geometry_msgs::msg::TwistStamped::SharedPtr msg)
+    {
+        learned_velocity::Observation sample;
+        sample.original_time = get_time_sec(msg->header.stamp);
+        sample.time = sample.original_time - time_diff_lidar_to_imu;
+        if (time_sync_en && std::abs(timediff_lidar_wrt_imu) > 0.1)
+            sample.time = sample.original_time + timediff_lidar_wrt_imu;
+        sample.arrival_time = this->now().seconds();
+        sample.velocity << msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z;
+        if (msg->header.frame_id != "base_link" || !sample.velocity.allFinite() ||
+            !std::isfinite(sample.time) || sample.original_time <= 0) {
+            learned_velocity::Result result;
+            result.observation = sample;
+            publish_velocity_fusion_debug(result, 2);
+            return;
+        }
+        if (sample.time <= p_imu->last_processed_time() + 1e-9) {
+            learned_velocity::Result result;
+            result.observation = sample;
+            publish_velocity_fusion_debug(result, 1);
+            return;
+        }
+        auto position = std::lower_bound(learned_velocity_queue_.begin(), learned_velocity_queue_.end(), sample.time,
+            [](const learned_velocity::Observation &entry, double stamp) { return entry.time < stamp; });
+        if ((position != learned_velocity_queue_.end() && std::abs(position->time - sample.time) < 1e-9) ||
+            (position != learned_velocity_queue_.begin() && std::abs((position - 1)->time - sample.time) < 1e-9)) {
+            learned_velocity::Result result;
+            result.observation = sample;
+            publish_velocity_fusion_debug(result, 2);
+            return;
+        }
+        learned_velocity_queue_.insert(position, sample);
+        if (learned_velocity_queue_.size() > 512) {
+            learned_velocity::Result result;
+            result.observation = learned_velocity_queue_.back();
+            publish_velocity_fusion_debug(result, 2);
+            learned_velocity_queue_.pop_back();
+        }
+    }
+
     void timer_callback()
     {
+        if (learned_velocity_enabled_ && imu_time_reset_pending) {
+            {
+                std::lock_guard<std::mutex> lock(mtx_buffer);
+                lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
+            }
+            learned_velocity_queue_.clear();
+            p_imu->Reset();
+            state_ikfom reset_state;
+            kf.change_x(reset_state);
+            auto reset_cov = kf.get_P();
+            reset_cov.setIdentity();
+            kf.change_P(reset_cov);
+            flg_first_scan = true;
+            flg_EKF_inited = false;
+            Localmap_Initialized = false;
+            path.poses.clear();
+            if (locate_in_prior_map_) {
+                // The old map-to-filter transform no longer applies to the reset filter.
+                initial_pose_received_ = false;
+                map_tf_valid_ = false;
+                relocalization_pending_ = true;
+                mapping_paused_ = append_to_prior_map_;
+            } else {
+                // Start a new mapping frame with the reset filter.
+                ikdtree.Build(PointVector());
+            }
+            RCLCPP_WARN(this->get_logger(),
+                "IMU time moved backwards; reset filter and map alignment. Prior-map localization requires a new ICP pose");
+        }
+        imu_time_reset_pending = false;
         if (append_to_prior_map_ && (mapping_paused_ || !initial_pose_received_)) {
             std::lock_guard<std::mutex> lock(mtx_buffer);
             lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
+            learned_velocity_queue_.clear();
             return;
         }
         if (map_tf_valid_)
@@ -1056,6 +1210,7 @@ private:
                 // Discard drifted attitude and IMU biases as well as position.
                 // IMU_init restores gravity, biases and configured extrinsics.
                 p_imu->Reset();
+                learned_velocity_queue_.clear();
                 state_ikfom reset_state;
                 kf.change_x(reset_state);
                 auto reset_cov = kf.get_P();
@@ -1251,8 +1406,8 @@ private:
                 predicted_orientation.z(), predicted_orientation.w()};
             const auto P = kf.get_P();
             for (int i = 0; i < 3; ++i) {
-                diagnostics.position_stddev[i] = std::sqrt(std::max(0.0, P(i + 3, i + 3)));
-                diagnostics.rotation_stddev[i] = std::sqrt(std::max(0.0, P(i, i)));
+                diagnostics.position_stddev[i] = std::sqrt(std::max(0.0, P(i, i)));
+                diagnostics.rotation_stddev[i] = std::sqrt(std::max(0.0, P(i + 3, i + 3)));
                 diagnostics.lidar_position_correction[i] = update_valid
                     ? state_point.pos[i] - predicted_state.pos[i] : std::numeric_limits<double>::quiet_NaN();
             }
@@ -1420,9 +1575,15 @@ private:
     rclcpp::Publisher<fast_lio::msg::EstimatorDiagnostics>::SharedPtr pubEstimatorDiagnostics_;
     rclcpp::Publisher<fast_lio::msg::PoseInformation>::SharedPtr pubPoseInformation_;
     rclcpp::Publisher<fast_lio::msg::MatchDebug>::SharedPtr pubMatchDebug_;
+    rclcpp::Publisher<fast_lio::msg::VelocityFusionDebug>::SharedPtr pubVelocityFusionDebug_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pubExtrinsic_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr subLearnedVelocity_;
+    std::deque<learned_velocity::Observation> learned_velocity_queue_;
+    std::string velocity_mode_ = "imu_lidar";
+    std::string velocity_topic_ = "/estimated_velocity";
+    bool learned_velocity_enabled_ = false;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_init_pose_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr pause_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr checkpoint_map_pub_;
